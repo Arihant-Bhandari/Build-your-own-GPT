@@ -2,14 +2,17 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-batch_size = 32 # parallel processing batches
-block_size = 8 # maximum content length
+batch_size = 64 # parallel processing batches
+block_size = 256 # maximum content length
 max_iters = 5000
-eval_interval = 300
-lr = 1e-3
+eval_interval = 500
+lr = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 
 torch.manual_seed(1337)
 
@@ -61,6 +64,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x) # (B, T, C)
@@ -71,6 +76,7 @@ class Head(nn.Module):
 
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         weights = F.softmax(weights, dim=-1) # (B, T, T)
+        weights = self.dropout(weights)
 
         # weighted aggregationof values
         v = self.value(x) # (B, T, C)
@@ -84,7 +90,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd)
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -96,10 +103,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 class Block(nn.Module):
@@ -123,12 +131,8 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # vocab_size X 32 dimensional embeddings => 65*32: gives token embeddings
         self.position_embedding_table = nn.Embedding(block_size, n_embd) # each token from 0 to blocksize+1 will also get positonal vector embedding
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            nn.LayerNorm(n_embd),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size) # linear model head
     
     def forward(self, idx, targets=None):
@@ -136,7 +140,8 @@ class BigramLanguageModel(nn.Module):
         tok_embd = self.token_embedding_table(idx) # {batch, time, embedded channel}
         pos_embd = self.position_embedding_table(torch.arange(T, device=device).unsqueeze(0).expand(B, T)) # {time, channel}
         x = tok_embd + pos_embd # {batch, time, embedded channel}
-        x = self.blocks(x)
+        x = self.blocks(x) # {batch, time, embedded channel}
+        x = self.ln_f(x) # {batch, time, embedded channel}
         logits = self.lm_head(x) # contains both {how tokens are being represented} + {where the token is positioned}
         
         if targets is None:
